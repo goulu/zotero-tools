@@ -136,7 +136,21 @@ zotero-cleaner clean-titles --limit 200
 zotero-cleaner clean-titles --limit 200 --apply
 ```
 
-### 8. Clean automatic tags
+### 8. Check local PDF files
+```bash
+# Check files attached in Zotero and search missing content recursively in /home/goulu/Documents/Articles (default)
+zotero-cleaner check-pdfs
+
+# Restore missing Zotero files only when the local PDF has the expected MD5 checksum
+zotero-cleaner check-pdfs --apply
+
+# Use another source folder
+zotero-cleaner check-pdfs --directory /path/to/articles
+```
+
+Without `--apply`, the command is read-only. It checks whether Zotero can serve each PDF attachment and lists missing files. A missing attachment is recoverable only when a same-named source PDF has the expected MD5 checksum.
+
+### 9. Clean automatic tags
 ```bash
 # Dry-run
 zotero-cleaner clean-tags --limit 200

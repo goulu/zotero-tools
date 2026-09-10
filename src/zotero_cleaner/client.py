@@ -2,6 +2,7 @@
 
 import os
 import re
+import hashlib
 from pathlib import Path
 from typing import Any, Callable, Generator, Optional
 import httpx
@@ -297,6 +298,103 @@ class ZoteroClient:
         if resp.status_code not in (200, 204):
             raise ZoteroClientError(f"Failed to update {item_key}: HTTP {resp.status_code} - {resp.text}")
         return resp.json() if resp.content else {}
+
+    def attachment_file_exists(self, item_key: str) -> bool:
+        """Return whether Zotero can serve the attachment file content."""
+        try:
+            with self.client.stream(
+                "GET",
+                f"/api/users/{self.config.user_id}/items/{item_key}/file",
+                headers={"Range": "bytes=0-0"},
+                follow_redirects=False,
+            ) as resp:
+                self._capture_server_id(resp)
+                if resp.status_code in (200, 206, 302):
+                    return True
+                if resp.status_code == 404:
+                    return False
+                raise ZoteroClientError(
+                    f"Unable to check attachment {item_key}: HTTP {resp.status_code}"
+                )
+        except httpx.RequestError as error:
+            raise ZoteroClientError(
+                f"Unable to check attachment {item_key}: {error}"
+            )
+
+    def restore_attachment_file(self, item: ZoteroItem, source: Path) -> None:
+        """Restore an existing attachment from a verified local source PDF."""
+        expected_md5 = item.md5
+        if not expected_md5:
+            raise ZoteroClientError(
+                f"Attachment {item.key} has no MD5 checksum to verify restoration."
+            )
+
+        digest = hashlib.md5(source.read_bytes()).hexdigest()
+        if digest.casefold() != expected_md5.casefold():
+            raise ZoteroClientError(
+                f"Source file checksum does not match attachment {item.key}."
+            )
+
+        headers = self._prepare_write_headers(item.version)
+        headers.update(
+            {
+                "If-Match": expected_md5,
+                "Content-Type": "application/x-www-form-urlencoded",
+            }
+        )
+        metadata = {
+            "md5": digest,
+            "filename": source.name,
+            "filesize": str(source.stat().st_size),
+            "mtime": str(int(source.stat().st_mtime * 1000)),
+        }
+        response = self.client.post(
+            f"/api/users/{self.config.user_id}/items/{item.key}/file",
+            headers=headers,
+            data=metadata,
+        )
+        self._capture_server_id(response)
+        if response.status_code != 200:
+            raise ZoteroClientError(
+                f"Unable to authorize restoration of {item.key}: "
+                f"HTTP {response.status_code} - {response.text}"
+            )
+
+        authorization = response.json()
+        if authorization.get("exists"):
+            return
+        required_keys = ("url", "prefix", "suffix", "uploadKey")
+        if not all(authorization.get(key) for key in required_keys):
+            raise ZoteroClientError(
+                f"Unexpected upload authorization response for {item.key}."
+            )
+
+        upload_response = self.client.post(
+            authorization["url"],
+            content=(
+                authorization["prefix"].encode()
+                + source.read_bytes()
+                + authorization["suffix"].encode()
+            ),
+            headers={"Content-Type": authorization["contentType"]},
+        )
+        if upload_response.status_code != 201:
+            raise ZoteroClientError(
+                f"Unable to upload {item.key}: HTTP {upload_response.status_code} "
+                f"- {upload_response.text}"
+            )
+
+        register_response = self.client.post(
+            f"/api/users/{self.config.user_id}/items/{item.key}/file",
+            headers=headers,
+            data={"upload": authorization["uploadKey"]},
+        )
+        self._capture_server_id(register_response)
+        if register_response.status_code != 204:
+            raise ZoteroClientError(
+                f"Unable to register restored file for {item.key}: "
+                f"HTTP {register_response.status_code} - {register_response.text}"
+            )
 
     def delete_item(self, item_key: str, version: int) -> bool:
         """Delete an item with version check, moving it to Zotero's Trash."""

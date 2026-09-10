@@ -2,6 +2,8 @@
 
 from collections import defaultdict
 from dataclasses import dataclass, field
+import hashlib
+from pathlib import Path
 from typing import Optional
 from zotero_cleaner.models import ZoteroItem
 
@@ -39,6 +41,16 @@ class DuplicateAttachmentGroup:
         if not self.master_item:
             self.determine_master()
         return [it for it in self.items if it.key != (self.master_item.key if self.master_item else "")]
+
+
+@dataclass
+class PdfAttachmentCheck:
+    attachment: ZoteroItem
+    matches: list[Path] = field(default_factory=list)
+
+    @property
+    def found(self) -> bool:
+        return bool(self.matches)
 
 
 class AttachmentCleaner:
@@ -153,3 +165,43 @@ class AttachmentCleaner:
                     groups.append(grp)
 
         return groups
+
+    def check_pdf_files(
+        self, attachments: list[ZoteroItem], directory: Path
+    ) -> list[PdfAttachmentCheck]:
+        """Find local PDFs matching the filenames of Zotero PDF attachments."""
+        pdfs_by_name: dict[str, list[Path]] = defaultdict(list)
+        for path in directory.rglob("*"):
+            if path.is_file() and path.suffix.lower() == ".pdf":
+                pdfs_by_name[path.name.casefold()].append(path)
+
+        checks = []
+        for attachment in attachments:
+            filename = attachment.filename or ""
+            if attachment.is_attachment and filename.lower().endswith(".pdf"):
+                checks.append(
+                    PdfAttachmentCheck(
+                        attachment=attachment,
+                        matches=sorted(pdfs_by_name[filename.casefold()]),
+                    )
+                )
+        return checks
+
+    @staticmethod
+    def file_md5(path: Path) -> str:
+        """Return a file MD5 checksum without loading the full file into memory."""
+        digest = hashlib.md5()
+        with path.open("rb") as file:
+            for chunk in iter(lambda: file.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def find_matching_pdf(self, check: PdfAttachmentCheck) -> Optional[Path]:
+        """Return a source PDF only when its checksum matches the Zotero attachment."""
+        expected_md5 = (check.attachment.md5 or "").casefold()
+        if not expected_md5:
+            return None
+        for path in check.matches:
+            if self.file_md5(path).casefold() == expected_md5:
+                return path
+        return None

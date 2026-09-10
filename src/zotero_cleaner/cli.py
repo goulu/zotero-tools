@@ -1,5 +1,6 @@
 """Command line interface for Zotero Cleaner."""
 
+from pathlib import Path
 from typing import Optional
 import typer
 from rich.console import Console
@@ -464,6 +465,106 @@ def clean_attachments(
                 prog.advance(task)
 
     console.print(f"[bold green]✔ {deleted} duplicate attachment(s) moved to Zotero's Trash![/bold green]")
+
+
+@app.command()
+def check_pdfs(
+    directory: str = typer.Option(
+        "/home/goulu/Documents/Articles",
+        "--directory",
+        "-d",
+        help="Folder to search recursively for PDF files",
+    ),
+    limit: int = typer.Option(0, "--limit", "-n", help="Max attachments to analyze (0 = all)"),
+    apply: bool = typer.Option(False, "--apply", help="Restore missing Zotero files from verified local PDFs"),
+    url: Optional[str] = typer.Option(None, "--url", "-u", help="Local API URL"),
+):
+    """Check Zotero PDF attachments and restore missing files from a local folder."""
+    search_directory = Path(directory).expanduser()
+    if not search_directory.is_dir():
+        console.print(f"[bold red]Error:[/bold red] Folder does not exist: {search_directory}")
+        raise typer.Exit(code=1)
+
+    client = get_client(url=url)
+    max_items = None if limit <= 0 else limit
+    attachments = []
+    try:
+        for item in client.iter_all_items(
+            batch_size=100,
+            max_items=max_items,
+            top_level=False,
+            item_type="attachment",
+        ):
+            attachments.append(item)
+    except ZoteroClientError as error:
+        console.print(f"[bold red]Error loading attachments:[/bold red] {error}")
+        raise typer.Exit(code=1)
+
+    cleaner = AttachmentCleaner()
+    checks = cleaner.check_pdf_files(attachments, search_directory)
+    missing = []
+    recoverable = []
+    present_count = 0
+    for check in checks:
+        try:
+            if client.attachment_file_exists(check.attachment.key):
+                present_count += 1
+                continue
+        except ZoteroClientError as error:
+            console.print(f"[yellow]Unable to check {check.attachment.key}: {error}[/yellow]")
+            continue
+
+        source = cleaner.find_matching_pdf(check)
+        if source:
+            recoverable.append((check, source))
+        else:
+            missing.append(check)
+
+    table = Table(title="Missing Zotero PDF Attachments", show_header=True, header_style="bold blue")
+    table.add_column("Key", style="cyan", width=10)
+    table.add_column("Filename", style="white")
+    table.add_column("Status", width=10)
+    table.add_column("Located file(s)", style="green")
+    for check, source in recoverable:
+        table.add_row(
+            check.attachment.key,
+            check.attachment.filename or "",
+            "[yellow]Recoverable[/yellow]",
+            str(source),
+        )
+    for check in missing:
+        locations = "\n".join(str(path) for path in check.matches)
+        table.add_row(
+            check.attachment.key,
+            check.attachment.filename or "",
+            "[red]Missing[/red]",
+            locations or "-",
+        )
+
+    console.print(table)
+    console.print(
+        f"[bold]Checked:[/bold] {len(checks)} PDF attachment(s); "
+        f"[green]present {present_count}[/green], "
+        f"[yellow]recoverable {len(recoverable)}[/yellow], "
+        f"[red]missing {len(missing)}[/red]."
+    )
+
+    if not apply or not recoverable:
+        return
+
+    ensure_authorized(client)
+    if not typer.confirm(f"Restore {len(recoverable)} missing PDF attachment(s) in Zotero?"):
+        console.print("[yellow]Operation cancelled.[/yellow]")
+        return
+
+    restored = 0
+    for check, source in recoverable:
+        try:
+            client.restore_attachment_file(check.attachment, source)
+            restored += 1
+        except ZoteroClientError as error:
+            console.print(f"[red]Error restoring {check.attachment.key}: {error}[/red]")
+    console.print(f"[bold green]✔ {restored} Zotero PDF attachment(s) restored.[/bold green]")
 
 
 @app.command()
