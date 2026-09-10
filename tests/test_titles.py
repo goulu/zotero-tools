@@ -52,3 +52,21 @@ def test_trailing_dot():
     item_initial = make_test_item("Notes on Physics by Feynman, R. P.")
     issues_initial = cleaner.analyze(item_initial)
     assert len(issues_initial) == 0
+
+
+def test_extract_embedded_citation():
+    cleaner = TitleCleaner(extract_citations=True)
+    raw_title = "Frédéric Leclerc (2018) : Un temps pour l’éternité Éd livre, 2018, ISBN: 978-2414258000."
+    item = make_test_item(raw_title)
+
+    issues = cleaner.analyze(item)
+    assert len(issues) == 1
+    issue = issues[0]
+    assert issue.proposed_value == "Un temps pour l’éternité"
+    assert issue.patch_data["title"] == "Un temps pour l’éternité"
+    assert issue.patch_data["date"] == "2018"
+    assert issue.patch_data["ISBN"] == "9782414258000"
+    assert len(issue.patch_data["creators"]) == 1
+    assert issue.patch_data["creators"][0]["firstName"] == "Frédéric"
+    assert issue.patch_data["creators"][0]["lastName"] == "Leclerc"
+

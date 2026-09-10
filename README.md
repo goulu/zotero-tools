@@ -24,10 +24,15 @@ Designed for **maximum safety** with a **Dry-Run (simulation) mode by default**.
   - Safely moves duplicates to Zotero's **Trash** with user confirmation
   - Optional alternative: tag duplicates with `zotero-cleaner:duplicate-attachment`
 - **Title cleanup (`clean-titles`)**:
+  - Automatically extracts embedded bibliographic citations in titles (e.g., `"Author (Year) : Title Publisher, ISBN..."`):
+    - Cleans the title to keep only the pure document title
+    - Populates the reference's `creators` (authors) if empty
+    - Populates `date` (publication year) if empty
+    - Extracts and populates `ISBN` if empty
   - Converts ALL-CAPS titles to Sentence case
   - Strips HTML tags (`<i>`, `<b>`, `<jats:...>`) and unescapes entities (`&amp;`)
   - Normalizes multiple spaces, tabs, and newline characters
-  - Removes unnecessary trailing dots (while preserving initials like "A.")
+  - Removes unnecessary trailing periods (while preserving initials like "A.")
 - **Creator / author standardization**:
   - Splits single-field "Lastname, Firstname" into proper first and last name fields
   - Corrects ALL-CAPS names

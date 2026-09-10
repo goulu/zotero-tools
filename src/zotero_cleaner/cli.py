@@ -213,11 +213,20 @@ def clean_titles(
     apply: bool = typer.Option(False, "--apply", help="Apply modifications (default: dry-run / simulation)"),
     fix_all_caps: bool = typer.Option(True, "--all-caps/--no-all-caps", help="Convert ALL-CAPS titles to Sentence case"),
     strip_trailing_dot: bool = typer.Option(True, "--strip-dot/--no-strip-dot", help="Remove unnecessary trailing periods"),
+    extract_citations: bool = typer.Option(
+        True,
+        "--extract-citations/--no-extract-citations",
+        help="Extract embedded author(s), year, and ISBN from title into structured metadata",
+    ),
     url: Optional[str] = typer.Option(None, "--url", "-u", help="Local API URL"),
 ):
-    """Audit and clean title formatting (ALL CAPS, HTML tags, whitespace, trailing periods)."""
+    """Audit and clean title formatting (embedded authors/citations, ALL CAPS, HTML tags, trailing periods)."""
     client = get_client(url=url)
-    cleaner = TitleCleaner(fix_all_caps=fix_all_caps, strip_trailing_dot=strip_trailing_dot)
+    cleaner = TitleCleaner(
+        fix_all_caps=fix_all_caps,
+        strip_trailing_dot=strip_trailing_dot,
+        extract_citations=extract_citations,
+    )
     max_items = None if limit <= 0 else limit
 
     issues = []
