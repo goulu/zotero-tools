@@ -3,7 +3,7 @@
 A suite of high-performance Python tools to audit, clean, and populate your Zotero bibliography by communicating directly with the local Zotero HTTP API (`http://localhost:23119/api`).
 
 The suite includes two primary tools:
-1. **`zotero-cleaner`** 🧹 : Library audit, title/tag cleanup, and duplicate detection/cleanup.
+1. **`zotero-cleaner`** 🧹 : Library audit, title/tag cleanup, attachment verification, and duplicate detection/cleanup.
 2. **`pdf-importer`** (or `zotero-import-pdf`) 📥 : Fast batch PDF importer with automatic metadata extraction (DOI + CrossRef, PDF Info, directory & filename heuristics) and duplicate prevention.
 
 Designed for **maximum safety** with **dry-run simulation modes**.
@@ -93,6 +93,7 @@ pdf-importer inspect "/path/to/paper.pdf"
 - **Duplicates (`duplicates`)**: Search for duplicate references by DOI, ISBN, and Title + Author.
 - **Attachments (`clean-attachments`)**: Find and clean redundant PDF attachments or snapshots.
 - **Titles (`clean-titles`)**: Clean up titles, stripping embedded citations, HTML tags, and ALL CAPS.
+- **PDF Verification (`check-pdfs`)**: Verify that attached PDF files exist on disk in Zotero storage and recover missing ones from an external directory if the MD5 matches.
 - **Tags (`clean-tags`)**: Remove unwanted automatic tags from connectors.
 
 ### Usage Examples
@@ -101,20 +102,44 @@ pdf-importer inspect "/path/to/paper.pdf"
 # Check connection to Zotero
 zotero-cleaner ping
 
+# Authorize write access
+zotero-cleaner auth
+
 # Display library stats
 zotero-cleaner stats
 
 # General library audit
-zotero-cleaner audit
+zotero-cleaner audit --limit 100
 
-# Audit duplicates (dry-run)
-zotero-cleaner duplicates
+# Audit duplicate references (dry-run)
+zotero-cleaner duplicates --limit 1000
+
+# Tag duplicate references in Zotero
+zotero-cleaner duplicates --limit 1000 --tag --apply
 
 # Clean redundant attachments (dry-run)
-zotero-cleaner clean-attachments
+zotero-cleaner clean-attachments --limit 500
+
+# Move duplicate attachments to Zotero Trash (interactive confirmation)
+zotero-cleaner clean-attachments --limit 0 --apply
 
 # Clean title formatting (dry-run)
-zotero-cleaner clean-titles
+zotero-cleaner clean-titles --limit 200
+
+# Apply title cleanup
+zotero-cleaner clean-titles --limit 200 --apply
+
+# Check local PDF files in Zotero storage
+zotero-cleaner check-pdfs
+
+# Restore missing files from local folder when MD5 matches
+zotero-cleaner check-pdfs --apply
+
+# Clean automatic tags (dry-run)
+zotero-cleaner clean-tags --limit 200
+
+# Apply tag cleanup
+zotero-cleaner clean-tags --limit 200 --apply
 ```
 
 ---
