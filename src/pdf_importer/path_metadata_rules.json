@@ -1,0 +1,38 @@
+{
+  "rules": [
+    {
+      "name": "patents-folder",
+      "path_regex": "(?:^|/)_Patents/(?P<patent_number>[^/]+)\\.pdf$",
+      "item_type": "patent",
+      "fields": {
+        "patent_number": "patent_number"
+      }
+    },
+    {
+      "name": "books-folder",
+      "path_regex": "(?:^|)/(?:_Book|Book_)/(?P<year>(?:19|20)\\d{2})/(?P<author>[^/]+?)\\s*-\\s*(?P<title>[^/]+)\\.pdf$",
+      "item_type": "book",
+      "fields": {
+        "date": "year",
+        "title": "title"
+      },
+      "creator_capture": "author"
+    },
+    {
+      "name": "books-folder-default",
+      "path_regex": "(?:^|)/(?:_Book|Book_)/.+\\.pdf$",
+      "item_type": "book"
+    },
+    {
+      "name": "journal-year-author-title",
+      "path_regex": "(?:^|)/(?P<journal>[^/]+)/(?P<year>(?:19|20)\\d{2})/(?P<author>[^/]+?)\\s*-\\s*(?P<title>[^/]+)\\.pdf$",
+      "item_type": "journalArticle",
+      "fields": {
+        "date": "year",
+        "publication_title": "journal",
+        "title": "title"
+      },
+      "creator_capture": "author"
+    }
+  ]
+}

@@ -1,6 +1,6 @@
 """Command Line Interface for PDF Importer."""
 
-import os
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 import typer
@@ -9,9 +9,10 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 from rich.table import Table
+from rich.text import Text
 
 from zotero_cleaner.client import ZoteroClient
-from pdf_importer.config import PDFImporterConfig, DEFAULT_IMPORTER_CONFIG
+from pdf_importer.config import DEFAULT_IMPORTER_CONFIG
 from pdf_importer.extractor import extract_pdf_metadata
 from pdf_importer.importer import PDFImporter, discover_pdf_files
 
@@ -21,6 +22,13 @@ app = typer.Typer(
     add_completion=False,
 )
 console = Console()
+
+
+def _append_import_error(log_path: Path, file_path: Path, reason: str) -> None:
+    timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+    safe_reason = reason.replace("\r", " ").replace("\n", " ")
+    with log_path.open("a", encoding="utf-8") as log_file:
+        log_file.write(f"{timestamp}\t{file_path}\t{safe_reason}\n")
 
 
 def _get_target_path(path_arg: Optional[str], default_path: Path) -> Path:
@@ -78,6 +86,13 @@ def import_pdfs(
     """
     cfg = DEFAULT_IMPORTER_CONFIG
     target_dir = _get_target_path(path, cfg.import_dir)
+    error_log_path = Path.cwd() / "pdf-importer-errors.log"
+    with error_log_path.open("a", encoding="utf-8") as log_file:
+        log_file.write(
+            f"\n[{datetime.now().astimezone().isoformat(timespec='seconds')}] "
+            "PDF import started\n"
+        )
+    console.print(f"[dim]Error log: {error_log_path}[/]")
 
     if mode:
         cfg.link_mode = mode.lower()
@@ -95,37 +110,55 @@ def import_pdfs(
     try:
         ping_info = client.ping()
         console.print(f"[green]✓[/] Connected to Zotero (v{ping_info.get('version')})")
-    except Exception as e:
-        console.print(f"[bold red]Cannot connect to Zotero:[/] {e}")
+    except Exception as error:
+        _append_import_error(
+            error_log_path,
+            target_dir,
+            f"Cannot connect to Zotero: {error}",
+        )
+        console.print(f"[bold red]Cannot connect to Zotero:[/] {error}")
         raise typer.Exit(code=1)
 
     importer = PDFImporter(client=client, config=cfg)
+    try:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            TimeElapsedColumn(),
+            console=console,
+        ) as progress:
+            idx_task = progress.add_task(
+                "[cyan]Indexing Zotero library for duplicates...",
+                total=None,
+            )
 
-    # 1. Build index with progress spinner
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        TimeElapsedColumn(),
-        console=console,
-    ) as progress:
-        idx_task = progress.add_task("[cyan]Indexing Zotero library for duplicates...", total=None)
+            def on_idx(phase: str, count: int, total: int):
+                progress.update(
+                    idx_task,
+                    description=f"[cyan]Indexing {phase} ({count}/{total})...",
+                )
 
-        def on_idx(phase: str, count: int, total: int):
-            progress.update(idx_task, description=f"[cyan]Indexing {phase} ({count}/{total})...")
-
-        importer.ensure_index(include_references=not quick_index, on_progress=on_idx)
-        progress.update(idx_task, description="[green]Library index loaded successfully!")
+            importer.ensure_index(
+                include_references=not quick_index,
+                on_progress=on_idx,
+            )
+            progress.update(
+                idx_task,
+                description="[green]Library index loaded successfully!",
+            )
+    except Exception as error:
+        _append_import_error(
+            error_log_path,
+            target_dir,
+            f"Failed to index Zotero library: {error}",
+        )
+        console.print(f"[bold red]Cannot index Zotero library:[/] {error}")
+        raise typer.Exit(code=1)
 
     console.print(
         f"[dim]Indexed {len(importer.index.filenames)} attachments, "
         f"{len(importer.index.dois)} DOIs, and {len(importer.index.titles)} reference titles.[/]\n"
     )
-
-    # 2. Process PDFs with interactive progress
-    table = Table(box=box.ROUNDED, expand=True)
-    table.add_column("File", style="cyan", ratio=3)
-    table.add_column("Status", ratio=2)
-    table.add_column("Title / Reason", ratio=5)
 
     with Progress(
         SpinnerColumn(),
@@ -138,30 +171,61 @@ def import_pdfs(
 
         def on_file(record, count):
             if record.status in ("imported", "dry_run_import"):
-                status_style = "[bold green]IMPORTED[/]" if not dry_run else "[bold yellow]WOULD IMPORT[/]"
-                title_disp = record.metadata.title if record.metadata else record.file_path.name
-                src_disp = f" [dim]({record.metadata.source})[/]" if record.metadata else ""
-                table.add_row(record.file_path.name, status_style, f"{title_disp}{src_disp}")
+                status_label = "WOULD IMPORT" if dry_run else "IMPORTED"
+                status_style = "yellow" if dry_run else "green"
+                title = (
+                    record.metadata.title
+                    if record.metadata
+                    else record.file_path.name
+                )
+                source = (
+                    f" ({record.metadata.source})"
+                    if record.metadata
+                    else ""
+                )
+                detail = f"{title}{source}"
             elif record.status == "skipped_duplicate":
-                table.add_row(record.file_path.name, "[dim yellow]DUPLICATE[/]", f"[dim]{record.reason}[/]")
+                status_label = "DUPLICATE"
+                status_style = "yellow"
+                detail = record.reason or "Already in Zotero"
             elif record.status == "error":
-                table.add_row(record.file_path.name, "[bold red]ERROR[/]", f"[red]{record.reason}[/]")
+                status_label = "ERROR"
+                status_style = "red"
+                detail = record.reason or "Unknown error"
+                _append_import_error(error_log_path, record.file_path, detail)
+            else:
+                status_label = record.status.upper()
+                status_style = "white"
+                detail = record.reason or ""
 
-            progress.update(scan_task, advance=1, description=f"[yellow]Processed {count} PDFs...")
+            line = Text(f"{count:>4} ")
+            line.append(status_label, style=f"bold {status_style}")
 
-        summary = importer.import_directory(
-            target_dir,
-            recursive=recursive,
-            dry_run=dry_run,
-            max_files=max_files,
-            use_crossref=crossref,
-            on_file_processed=on_file,
-        )
+            line.append(f" | {record.file_path.name} | {detail}")
+            progress.console.print(line)
+            progress.update(
+                scan_task,
+                advance=1,
+                description=f"[yellow]Processed {count} PDFs...",
+            )
 
-    # 3. Print Results Table & Summary
-    console.print("\n")
-    if summary.records:
-        console.print(table)
+        try:
+            summary = importer.import_directory(
+                target_dir,
+                recursive=recursive,
+                dry_run=dry_run,
+                max_files=max_files,
+                use_crossref=crossref,
+                on_file_processed=on_file,
+            )
+        except Exception as error:
+            _append_import_error(
+                error_log_path,
+                target_dir,
+                f"PDF processing stopped: {error}",
+            )
+            console.print(f"[bold red]PDF processing stopped:[/] {error}")
+            raise typer.Exit(code=1)
 
     summary_panel = (
         f"[bold]Import Summary[/]\n\n"

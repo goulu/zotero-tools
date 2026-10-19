@@ -12,6 +12,7 @@ from zotero_cleaner.models import ZoteroItem
 from pdf_importer.config import PDFImporterConfig, DEFAULT_IMPORTER_CONFIG
 from pdf_importer.extractor import (
     ExtractedMetadata,
+    apply_path_metadata_rules,
     compute_file_md5,
     extract_pdf_metadata,
     fetch_crossref_metadata_by_title,
@@ -256,9 +257,14 @@ class PDFImporter:
     def _filename_author(
         file_path: Path,
     ) -> tuple[tuple[str, str], dict[str, str]] | None:
-        if " - " not in file_path.stem:
-            return None
-        creators = parse_filename_heuristics(file_path).creators
+        path_metadata = apply_path_metadata_rules(
+            ExtractedMetadata(title=file_path.stem),
+            file_path,
+        )
+        creators = (
+            path_metadata.creators
+            or parse_filename_heuristics(file_path).creators
+        )
         if not creators:
             return None
         creator = creators[0]
@@ -272,85 +278,79 @@ class PDFImporter:
             return None
         return identity, creator
 
-    def _find_book_groups(
+    def _extract_metadata_or_book_fallback(
         self,
-        pdf_files: list[Path],
+        file_path: Path,
         use_crossref: bool,
+        allow_book_fallback: bool,
     ) -> tuple[
-        list[tuple[list[Path], ExtractedMetadata]],
-        dict[Path, ExtractedMetadata],
+        ExtractedMetadata,
+        Optional[tuple[tuple[Path, tuple[str, str]], ExtractedMetadata]],
     ]:
-        candidates: dict[tuple[Path, tuple[str, str]], list[Path]] = {}
-        for file_path in pdf_files:
-            author = self._filename_author(file_path)
-            if author:
-                identity, _ = author
-                key = (file_path.parent.resolve(), identity)
-                candidates.setdefault(key, []).append(file_path)
-
-        groups: list[tuple[list[Path], ExtractedMetadata]] = []
-        metadata_cache: dict[Path, ExtractedMetadata] = {}
-        for paths in candidates.values():
-            if len(paths) < 2:
-                continue
-
-            unresolved: list[Path] = []
-            for file_path in paths:
-                try:
-                    metadata = extract_pdf_metadata(
-                        file_path,
-                        use_crossref=use_crossref,
-                        timeout=self.config.crossref_timeout,
-                    )
-                except Exception:
-                    metadata = ExtractedMetadata(
-                        title=file_path.stem,
-                        source="fallback",
-                    )
-
-                metadata_cache[file_path] = metadata
-                if metadata.source in ("crossref", "crossref_title"):
-                    continue
-                if not metadata.creators:
-                    # Extraction already tried a title lookup without finding a match.
-                    unresolved.append(file_path)
-                    continue
-                if not use_crossref:
-                    unresolved.append(file_path)
-                    continue
-
-                match = fetch_crossref_metadata_by_title(
-                    metadata.title,
-                    timeout=self.config.crossref_timeout,
-                )
-                if match:
-                    merge_missing_metadata(metadata, match)
-                else:
-                    unresolved.append(file_path)
-
-            if len(unresolved) < 2:
-                continue
-
-            first_path = unresolved[0]
-            author = self._filename_author(first_path)
-            if not author:
-                continue
-            _, creator = author
-            book_directory = first_path.parent
-            year = None
-            if re.fullmatch(r"(?:19|20)\d{2}", book_directory.name):
-                year = book_directory.name
-                book_directory = book_directory.parent
-            book_metadata = ExtractedMetadata(
-                title=book_directory.name,
-                creators=[creator],
-                date=year,
-                item_type="book",
-                source="filename_group",
+        try:
+            metadata = extract_pdf_metadata(
+                file_path,
+                use_crossref=use_crossref,
+                timeout=self.config.crossref_timeout,
             )
-            groups.append((unresolved, book_metadata))
+        except Exception:
+            metadata = ExtractedMetadata(
+                title=file_path.stem,
+                source="fallback",
+            )
 
-        return groups, metadata_cache
+        if metadata.path_rule:
+            return metadata, None
+
+        if (
+            metadata.source in ("crossref", "crossref_title")
+            and metadata.creators
+        ):
+            return metadata, None
+
+        filename_author = self._filename_author(file_path)
+        search_author = None
+        if metadata.creators:
+            creator = metadata.creators[0]
+            search_author = creator.get("name") or " ".join(filter(None, (
+                creator.get("firstName", "").strip(),
+                creator.get("lastName", "").strip(),
+            )))
+        if not search_author and filename_author:
+            creator = filename_author[1]
+            search_author = creator.get("name") or " ".join(filter(None, (
+                creator.get("firstName", "").strip(),
+                creator.get("lastName", "").strip(),
+            )))
+
+        if use_crossref:
+            match = fetch_crossref_metadata_by_title(
+                metadata.title,
+                timeout=self.config.crossref_timeout,
+                author=search_author,
+            )
+            if match:
+                merge_missing_metadata(metadata, match)
+                return metadata, None
+
+        if not allow_book_fallback or not filename_author:
+            return metadata, None
+
+        identity, creator = filename_author
+        book_directory = file_path.parent
+        year = None
+        if re.fullmatch(r"(?:19|20)\d{2}", book_directory.name):
+            year = book_directory.name
+            book_directory = book_directory.parent
+        book_metadata = ExtractedMetadata(
+            title=book_directory.name,
+            creators=[creator],
+            date=year,
+            item_type="book",
+            source="filename_group",
+        )
+        group_key = (file_path.parent.resolve(), identity)
+        return metadata, (group_key, book_metadata)
 
     def _create_zotero_book_entry(
         self,
@@ -456,6 +456,8 @@ class PDFImporter:
         file_paths: list[Path],
         metadata: ExtractedMetadata,
         dry_run: bool,
+        existing_reference: Optional[ZoteroItem] = None,
+        attach_to_existing: bool = False,
     ) -> list[ItemImportRecord]:
         records: list[ItemImportRecord] = []
         pending_paths: list[Path] = []
@@ -499,7 +501,8 @@ class PDFImporter:
         if not pending_paths:
             return records
 
-        existing_reference = self.index.find_reference(metadata)
+        if existing_reference is None:
+            existing_reference = self.index.find_reference(metadata)
         if existing_reference and existing_reference.data.itemType != "book":
             for file_path in pending_paths:
                 records.append(ItemImportRecord(
@@ -533,7 +536,7 @@ class PDFImporter:
         if dry_run:
             action = (
                 "Would attach to existing book"
-                if existing_reference
+                if existing_reference or attach_to_existing
                 else "Would create book and attach"
             )
             return records + [ItemImportRecord(
@@ -665,14 +668,25 @@ class PDFImporter:
         """
         summary = ImportSummary()
         pdf_files = list(
-            discover_pdf_files(directory, recursive=recursive, max_files=max_files)
+            discover_pdf_files(
+                directory,
+                recursive=recursive,
+                max_files=max_files,
+            )
         )
-        groups, metadata_cache = self._find_book_groups(pdf_files, use_crossref)
-        groups_by_first_path = {
-            paths[0]: (paths, metadata)
-            for paths, metadata in groups
-        }
-        processed_paths: set[Path] = set()
+        author_counts: dict[tuple[Path, tuple[str, str]], int] = {}
+        for pdf_path in pdf_files:
+            author = self._filename_author(pdf_path)
+            if not author:
+                continue
+            identity, _ = author
+            group_key = (pdf_path.parent.resolve(), identity)
+            author_counts[group_key] = author_counts.get(group_key, 0) + 1
+
+        book_states: dict[
+            tuple[Path, tuple[str, str]],
+            tuple[ExtractedMetadata, Optional[str]],
+        ] = {}
 
         def record_processed(record: ItemImportRecord):
             processed_count = summary.total_scanned + 1
@@ -688,26 +702,68 @@ class PDFImporter:
                 on_file_processed(record, processed_count)
 
         for pdf_path in pdf_files:
-            if pdf_path in processed_paths:
-                continue
-            group = groups_by_first_path.get(pdf_path)
-            if group:
-                paths, metadata = group
-                for record in self._import_book_group(
-                    paths,
-                    metadata,
-                    dry_run,
-                ):
-                    record_processed(record)
-                processed_paths.update(paths)
+            filename_author = self._filename_author(pdf_path)
+            allow_book_fallback = False
+            if filename_author:
+                identity, _ = filename_author
+                group_key = (pdf_path.parent.resolve(), identity)
+                allow_book_fallback = author_counts.get(group_key, 0) > 1
+            metadata, book_fallback = self._extract_metadata_or_book_fallback(
+                pdf_path,
+                use_crossref,
+                allow_book_fallback=allow_book_fallback,
+            )
+            if book_fallback is None:
+                record = self.import_single_pdf(
+                    pdf_path,
+                    dry_run=dry_run,
+                    use_crossref=use_crossref,
+                    extracted_metadata=metadata,
+                )
+                record_processed(record)
                 continue
 
-            record = self.import_single_pdf(
-                pdf_path,
-                dry_run=dry_run,
-                use_crossref=use_crossref,
-                extracted_metadata=metadata_cache.get(pdf_path),
+            book_key, book_metadata = book_fallback
+            state = book_states.get(book_key)
+            if state is None:
+                records = self._import_book_group(
+                    [pdf_path],
+                    book_metadata,
+                    dry_run,
+                )
+                for record in records:
+                    record_processed(record)
+                    if record.status in ("imported", "dry_run_import"):
+                        book_states[book_key] = (
+                            book_metadata,
+                            record.item_key,
+                        )
+                continue
+
+            book_metadata, parent_key = state
+            existing_reference = None
+            if parent_key and not dry_run:
+                try:
+                    existing_reference = self.client.get_item(parent_key)
+                except Exception as error:
+                    record_processed(ItemImportRecord(
+                        file_path=pdf_path,
+                        status="error",
+                        reason=(
+                            f"Failed to load Zotero book {parent_key}: {error}"
+                        ),
+                        metadata=book_metadata,
+                    ))
+                    continue
+
+            records = self._import_book_group(
+                [pdf_path],
+                book_metadata,
+                dry_run,
+                existing_reference=existing_reference,
+                attach_to_existing=True,
             )
-            record_processed(record)
+            for record in records:
+                record_processed(record)
 
         return summary

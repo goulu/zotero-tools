@@ -1,6 +1,5 @@
 """HTTP client for the local Zotero API."""
 
-import os
 import re
 import hashlib
 from pathlib import Path
@@ -35,6 +34,7 @@ class ZoteroClient:
     def __init__(self, config: Optional[ZoteroConfig] = None):
         self.config = config or DEFAULT_CONFIG
         self.server_id: Optional[str] = None
+        self._authorization_attempted = False
 
         headers = {
             "Zotero-API-Version": "3",
@@ -141,6 +141,19 @@ class ZoteroClient:
             pass
 
         return api_key
+
+    def _request_authorization_once(self) -> None:
+        if self._authorization_attempted:
+            raise ZoteroClientError(
+                "Zotero refused the write request after authorization; "
+                "stopping to avoid repeated confirmation dialogs."
+            )
+        self._authorization_attempted = True
+        print(
+            "Waiting for manual authorization in Zotero...",
+            flush=True,
+        )
+        self.request_authorization()
 
     def ping(self) -> dict[str, Any]:
         """Check connectivity with the local Zotero instance."""
@@ -285,7 +298,7 @@ class ZoteroClient:
 
         if resp.status_code in (401, 428):
             if resp.status_code == 401 or "API key required" in resp.text:
-                self.request_authorization()
+                self._request_authorization_once()
                 headers = self._prepare_write_headers(version)
                 headers["Content-Type"] = "application/json"
                 resp = self.client.patch(
@@ -408,7 +421,7 @@ class ZoteroClient:
 
         if resp.status_code in (401, 428):
             if resp.status_code == 401 or "API key required" in resp.text:
-                self.request_authorization()
+                self._request_authorization_once()
                 headers = self._prepare_write_headers(version)
                 resp = self.client.delete(
                     f"/api/users/{self.config.user_id}/items/{item_key}",
@@ -458,7 +471,7 @@ class ZoteroClient:
 
         if resp.status_code in (401, 428):
             if resp.status_code == 401 or "API key required" in resp.text:
-                self.request_authorization()
+                self._request_authorization_once()
                 headers = self._prepare_write_headers(current_version)
                 headers["Content-Type"] = "application/json"
                 resp = self.client.post(

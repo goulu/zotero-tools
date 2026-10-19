@@ -7,8 +7,11 @@ Combines:
 """
 
 import hashlib
+import json
 import logging
+import os
 import re
+import unicodedata
 import warnings
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
@@ -22,6 +25,7 @@ logging.getLogger("pypdf").setLevel(logging.ERROR)
 warnings.filterwarnings("ignore", category=UserWarning, module="pypdf")
 
 DOI_REGEX = re.compile(r"\b(10\.\d{4,9}/[-._;()/:A-Za-z0-9]+)", re.IGNORECASE)
+DEFAULT_PATH_RULES = Path(__file__).with_name("path_metadata_rules.json")
 
 
 @dataclass
@@ -32,6 +36,8 @@ class ExtractedMetadata:
     publication_title: Optional[str] = None
     doi: Optional[str] = None
     isbn: Optional[str] = None
+    patent_number: Optional[str] = None
+    path_rule: Optional[str] = None
     item_type: str = "journalArticle"
     abstract_note: Optional[str] = None
     url: Optional[str] = None
@@ -56,6 +62,8 @@ class ExtractedMetadata:
             payload["DOI"] = self.doi
         if self.isbn:
             payload["ISBN"] = self.isbn
+        if self.patent_number:
+            payload["patentNumber"] = self.patent_number
         if self.abstract_note:
             payload["abstractNote"] = self.abstract_note
         if self.url:
@@ -125,6 +133,7 @@ def fetch_crossref_metadata(doi: str, timeout: float = 6.0) -> Optional[Extracte
 def fetch_crossref_metadata_by_title(
     title: str,
     timeout: float = 6.0,
+    author: Optional[str] = None,
 ) -> Optional[ExtractedMetadata]:
     """Search Crossref by title and accept only a close title match."""
     normalized_title = re.sub(r"[^\w\s]", "", title.lower())
@@ -134,11 +143,15 @@ def fetch_crossref_metadata_by_title(
 
     url = "https://api.crossref.org/works"
     headers = {"User-Agent": "ZoteroTools/0.1.0 (mailto:zotero-tools@local)"}
+    query = {"query.title": title, "rows": 5}
+    normalized_author = _normalize_author_name(author or "")
+    if normalized_author:
+        query["query.author"] = author
     try:
         with httpx.Client(timeout=timeout) as client:
             response = client.get(
                 url,
-                params={"query.title": title, "rows": 5},
+                params=query,
                 headers=headers,
             )
             if response.status_code != 200:
@@ -147,6 +160,25 @@ def fetch_crossref_metadata_by_title(
 
         matches = []
         for item in items:
+            if normalized_author:
+                candidate_authors = []
+                for candidate_author in item.get("author", []):
+                    candidate_name = " ".join(filter(None, (
+                        candidate_author.get("given", "").strip(),
+                        candidate_author.get("family", "").strip(),
+                        candidate_author.get("name", "").strip(),
+                    )))
+                    candidate_authors.append(
+                        _normalize_author_name(candidate_name)
+                    )
+                author_tokens = normalized_author.split()
+                if not any(
+                    normalized_author in candidate_author
+                    or candidate_author in normalized_author
+                    or author_tokens[-1] in candidate_author.split()
+                    for candidate_author in candidate_authors
+                ):
+                    continue
             titles = item.get("title", [])
             candidate_title = titles[0].strip() if titles else ""
             normalized_candidate = re.sub(
@@ -168,6 +200,16 @@ def fetch_crossref_metadata_by_title(
     except Exception:
         return None
     return None
+
+
+def _normalize_author_name(name: str) -> str:
+    decomposed = unicodedata.normalize("NFKD", name.casefold())
+    without_accents = "".join(
+        character
+        for character in decomposed
+        if not unicodedata.combining(character)
+    )
+    return " ".join(re.sub(r"[^\w\s]", "", without_accents).split())
 
 
 def _parse_crossref_message(
@@ -249,6 +291,61 @@ def merge_missing_metadata(
         metadata.item_type = supplement.item_type
     if supplement.creators:
         metadata.source = "crossref_title"
+    return metadata
+
+
+def _load_path_metadata_rules() -> list[dict[str, Any]]:
+    rules_path = Path(os.getenv("PDF_IMPORT_PATH_RULES", DEFAULT_PATH_RULES))
+    config = json.loads(rules_path.read_text(encoding="utf-8"))
+    return config.get("rules", [])
+
+
+PATH_METADATA_RULES = _load_path_metadata_rules()
+
+
+def _creator_from_path_author(author: str) -> list[dict[str, str]]:
+    parsed = parse_filename_heuristics(Path(f"{author} - title.pdf")).creators
+    if parsed:
+        return parsed
+    return [{"creatorType": "author", "lastName": author.strip()}]
+
+
+def apply_path_metadata_rules(
+    metadata: ExtractedMetadata,
+    file_path: Path,
+) -> ExtractedMetadata:
+    normalized_path = file_path.as_posix()
+    for rule in PATH_METADATA_RULES:
+        match = re.search(rule["path_regex"], normalized_path, re.IGNORECASE)
+        if not match:
+            continue
+
+        captures = match.groupdict()
+        metadata.item_type = rule["item_type"]
+        metadata.path_rule = rule["name"]
+        for metadata_field, capture_name in rule.get("fields", {}).items():
+            value = captures.get(capture_name)
+            if not value:
+                continue
+            if metadata_field == "title" and metadata.source in (
+                "fallback", "filename_heuristic"
+            ):
+                metadata.title = value.strip()
+            elif not getattr(metadata, metadata_field, None):
+                setattr(metadata, metadata_field, value.strip())
+
+        creator_capture = rule.get("creator_capture")
+        if creator_capture and captures.get(creator_capture):
+            creators = _creator_from_path_author(captures[creator_capture])
+            if not metadata.creators or metadata.source in (
+                "fallback", "filename_heuristic"
+            ):
+                metadata.creators = creators
+
+        patent_capture = rule.get("patent_number_capture")
+        if patent_capture and captures.get(patent_capture):
+            metadata.patent_number = captures[patent_capture].strip()
+        break
     return metadata
 
 
@@ -397,7 +494,7 @@ def extract_pdf_metadata(file_path: Path, use_crossref: bool = True, timeout: fl
     if found_doi and use_crossref:
         cr_meta = fetch_crossref_metadata(found_doi, timeout=timeout)
         if cr_meta and cr_meta.creators:
-            return cr_meta
+            return apply_path_metadata_rules(cr_meta, file_path)
         crossref_meta = cr_meta
 
     # Step 3: Heuristic extraction from filename and parent directories
@@ -430,4 +527,4 @@ def extract_pdf_metadata(file_path: Path, use_crossref: bool = True, timeout: fl
         if title_meta:
             merge_missing_metadata(heuristic_meta, title_meta)
 
-    return heuristic_meta
+    return apply_path_metadata_rules(heuristic_meta, file_path)

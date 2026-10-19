@@ -151,6 +151,48 @@ def test_crossref_title_lookup_rejects_equivalent_matches(monkeypatch):
     assert fetch_crossref_metadata_by_title("The Same Book Title") is None
 
 
+def test_crossref_title_lookup_includes_author(monkeypatch):
+    import pdf_importer.extractor as extractor
+
+    class Response:
+        status_code = 200
+
+        def json(self):
+            return {
+                "message": {
+                    "items": [{
+                        "title": ["A Historic Cosmology Article"],
+                        "author": [{"given": "Georges", "family": "Lemaitre"}],
+                        "DOI": "10.1234/lemaitre",
+                    }]
+                }
+            }
+
+    class Client:
+        def __init__(self, timeout):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def get(self, url, params, headers):
+            assert params["query.title"] == "A Historic Cosmology Article"
+            assert params["query.author"] == "Georges Lemaître"
+            return Response()
+
+    monkeypatch.setattr(extractor.httpx, "Client", Client)
+    metadata = fetch_crossref_metadata_by_title(
+        "A Historic Cosmology Article",
+        author="Georges Lemaître",
+    )
+
+    assert metadata is not None
+    assert metadata.doi == "10.1234/lemaitre"
+
+
 def test_extract_pdf_metadata_looks_up_title_when_author_missing(
     tmp_path,
     monkeypatch,
@@ -191,6 +233,90 @@ def test_extract_pdf_metadata_looks_up_title_when_author_missing(
     assert metadata.creators[0]["lastName"] == "Web Author"
     assert metadata.doi == "10.1234/sample"
     assert metadata.isbn == "978-1-23456-789-0"
+
+
+@pytest.mark.parametrize(
+    ("folder_name", "expected_item_type"),
+    [("_Book", "book"), ("_Patents", "patent")],
+)
+def test_extract_pdf_metadata_uses_special_folder_item_type(
+    tmp_path,
+    monkeypatch,
+    folder_name,
+    expected_item_type,
+):
+    from types import SimpleNamespace
+    import pdf_importer.extractor as extractor
+
+    pdf_file = tmp_path / folder_name / "Example.pdf"
+    pdf_file.parent.mkdir()
+    pdf_file.write_bytes(b"%PDF-1.4 sample")
+    monkeypatch.setattr(
+        extractor,
+        "PdfReader",
+        lambda path: SimpleNamespace(metadata=None, pages=[]),
+    )
+
+    metadata = extractor.extract_pdf_metadata(pdf_file, use_crossref=False)
+
+    assert metadata.item_type == expected_item_type
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "expected_type", "expected_title", "expected_author"),
+    [
+        (
+            "Nature/2020/Smith-Journal article.pdf",
+            "journalArticle",
+            "Journal article",
+            "Smith",
+        ),
+        (
+            "Book_/1998/Lemaitre-A book title.pdf",
+            "book",
+            "A book title",
+            "Lemaitre",
+        ),
+        (
+            "_Patents/US1234567.pdf",
+            "patent",
+            "US1234567",
+            None,
+        ),
+    ],
+)
+def test_path_rules_extract_default_metadata(
+    tmp_path,
+    monkeypatch,
+    relative_path,
+    expected_type,
+    expected_title,
+    expected_author,
+):
+    from types import SimpleNamespace
+    import pdf_importer.extractor as extractor
+
+    pdf_file = tmp_path / relative_path
+    pdf_file.parent.mkdir(parents=True)
+    pdf_file.write_bytes(b"%PDF-1.4 sample")
+    monkeypatch.setattr(
+        extractor,
+        "PdfReader",
+        lambda path: SimpleNamespace(metadata=None, pages=[]),
+    )
+
+    metadata = extractor.extract_pdf_metadata(pdf_file, use_crossref=False)
+    payload = metadata.to_zotero_item_payload()
+
+    assert metadata.item_type == expected_type
+    assert metadata.title == expected_title
+    if expected_author:
+        assert metadata.creators[0]["lastName"] == expected_author
+    if expected_type == "journalArticle":
+        assert metadata.date == "2020"
+        assert metadata.publication_title == "Nature"
+    if expected_type == "patent":
+        assert payload["patentNumber"] == "US1234567"
 
 
 def test_zotero_library_index_duplicates(tmp_path):
@@ -318,7 +444,7 @@ def test_importer_enriches_zotero_reference_missing_author(tmp_path, monkeypatch
 
 
 @pytest.mark.parametrize("use_crossref", [True, False])
-def test_find_book_groups_uses_folder_and_filename_author(
+def test_extract_metadata_builds_book_fallback_from_folder_and_author(
     tmp_path,
     monkeypatch,
     use_crossref,
@@ -326,10 +452,7 @@ def test_find_book_groups_uses_folder_and_filename_author(
     import pdf_importer.importer as importer_module
 
     book_dir = tmp_path / "The C Programming Language" / "1997"
-    chapter_paths = [
-        book_dir / "Stroustrup - 10 Classes.pdf",
-        book_dir / "Stroustrup, Library, Stroustrup - 11 Templates.pdf",
-    ]
+    chapter_path = book_dir / "Stroustrup - 10 Classes.pdf"
     importer = PDFImporter(client=MagicMock(), index=ZoteroLibraryIndex())
     monkeypatch.setattr(
         importer_module,
@@ -346,18 +469,89 @@ def test_find_book_groups_uses_folder_and_filename_author(
         lambda *args, **kwargs: None,
     )
 
-    groups, _ = importer._find_book_groups(
-        chapter_paths,
+    metadata, book_fallback = importer._extract_metadata_or_book_fallback(
+        chapter_path,
         use_crossref=use_crossref,
+        allow_book_fallback=True,
     )
 
-    assert len(groups) == 1
-    grouped_paths, metadata = groups[0]
-    assert grouped_paths == chapter_paths
-    assert metadata.title == "The C Programming Language"
-    assert metadata.date == "1997"
-    assert metadata.item_type == "book"
-    assert metadata.creators[0]["lastName"] == "Stroustrup"
+    assert metadata.title == "10 Classes"
+    assert book_fallback is not None
+    group_key, book_metadata = book_fallback
+    assert group_key[0] == book_dir.resolve()
+    assert book_metadata.title == "The C Programming Language"
+    assert book_metadata.date == "1997"
+    assert book_metadata.item_type == "book"
+    assert book_metadata.creators[0]["lastName"] == "Stroustrup"
+
+
+def test_single_lemaitre_pdf_stays_an_article(tmp_path, monkeypatch):
+    import pdf_importer.importer as importer_module
+
+    pdf_path = tmp_path / "ASSB" / "1927" / "Lemaître - Un Univers homogène.pdf"
+    article_metadata = ExtractedMetadata(
+        title="Un Univers homogène",
+        creators=[{"creatorType": "author", "lastName": "Lemaître"}],
+        date="1927",
+        publication_title="ASSB",
+        item_type="journalArticle",
+        source="filename_heuristic",
+    )
+    monkeypatch.setattr(
+        importer_module,
+        "extract_pdf_metadata",
+        lambda *args, **kwargs: article_metadata,
+    )
+    importer = PDFImporter(client=MagicMock(), index=ZoteroLibraryIndex())
+
+    metadata, book_fallback = importer._extract_metadata_or_book_fallback(
+        pdf_path,
+        use_crossref=False,
+        allow_book_fallback=False,
+    )
+
+    assert book_fallback is None
+    assert metadata.item_type == "journalArticle"
+    assert metadata.creators[0]["lastName"] == "Lemaître"
+
+
+def test_import_directory_does_not_make_book_for_single_pdf(
+    tmp_path,
+    monkeypatch,
+):
+    import pdf_importer.importer as importer_module
+
+    journal_dir = tmp_path / "ASSB" / "1927"
+    journal_dir.mkdir(parents=True)
+    pdf_path = journal_dir / "Lemaître - Un Univers homogène.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4 article")
+    article_metadata = ExtractedMetadata(
+        title="Un Univers homogène",
+        creators=[{"creatorType": "author", "lastName": "Lemaître"}],
+        date="1927",
+        publication_title="ASSB",
+        item_type="journalArticle",
+        source="filename_heuristic",
+    )
+    monkeypatch.setattr(
+        importer_module,
+        "extract_pdf_metadata",
+        lambda *args, **kwargs: article_metadata,
+    )
+    client = MagicMock()
+    importer = PDFImporter(client=client, index=ZoteroLibraryIndex())
+    importer.index_loaded = True
+
+    summary = importer.import_directory(
+        journal_dir,
+        dry_run=True,
+        use_crossref=False,
+    )
+
+    assert summary.total_scanned == 1
+    assert summary.records[0].metadata.item_type == "journalArticle"
+    assert summary.records[0].metadata.title == "Un Univers homogène"
+    client.create_items.assert_not_called()
 
 
 def test_import_directory_dry_run_groups_book_chapters(tmp_path, monkeypatch):
@@ -375,14 +569,22 @@ def test_import_directory_dry_run_groups_book_chapters(tmp_path, monkeypatch):
     client = MagicMock()
     importer = PDFImporter(client=client, index=ZoteroLibraryIndex())
     importer.index_loaded = True
-    monkeypatch.setattr(
-        importer_module,
-        "extract_pdf_metadata",
-        lambda path, **kwargs: ExtractedMetadata(
+    extraction_order = []
+    processed_counts = []
+
+    def extract_metadata(path, **kwargs):
+        assert len(extraction_order) == len(processed_counts)
+        extraction_order.append(path)
+        return ExtractedMetadata(
             title=path.stem.split(" - ", 1)[1],
             creators=[{"creatorType": "author", "lastName": "Stroustrup"}],
             source="filename_heuristic",
-        ),
+        )
+
+    monkeypatch.setattr(
+        importer_module,
+        "extract_pdf_metadata",
+        extract_metadata,
     )
     monkeypatch.setattr(
         importer_module,
@@ -395,14 +597,18 @@ def test_import_directory_dry_run_groups_book_chapters(tmp_path, monkeypatch):
         recursive=False,
         dry_run=True,
         max_files=2,
+        on_file_processed=lambda record, count: processed_counts.append(count),
     )
 
     assert summary.total_scanned == 2
+    assert extraction_order == chapter_paths
+    assert processed_counts == [1, 2]
     assert summary.imported == 2
     assert all(record.status == "dry_run_import" for record in summary.records)
     assert all(record.metadata.item_type == "book" for record in summary.records)
     assert all(record.metadata.title == "The C Programming Language" for record in summary.records)
-    assert all("Would create book" in record.reason for record in summary.records)
+    assert "Would create book" in summary.records[0].reason
+    assert "Would attach to existing book" in summary.records[1].reason
     client.create_items.assert_not_called()
 
 

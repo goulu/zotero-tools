@@ -58,6 +58,8 @@ Scans a directory of PDF files, determines if each file is already present in yo
   - Detects DOIs in PDF text or metadata, then queries the **CrossRef API** for complete bibliographic details (title, authors, journal, year, volume, issue, pages).
   - If no author is available in the PDF or matching Zotero reference, searches Crossref by title and fills missing author, DOI, ISBN, and bibliographic fields when the title matches closely.
   - Existing Zotero references without authors are enriched in place; `--dry-run` never writes changes.
+  - Processes PDFs sequentially; only when at least two PDFs in the same folder share a filename author and Crossref cannot identify their titles are they attached one by one to a book named after the containing folder.
+  - Path metadata rules are configurable in `src/pdf_importer/path_metadata_rules.json`: journal/year/author-title paths, `Book_` book paths, and `_Patents` patent paths are supported by default.
   - Reads embedded PDF document info (Title, Author, CreationDate).
   - Uses directory and filename heuristics (e.g. `.../<Journal>/<Year>/<Author> - <Title>.pdf`).
 - **Flexible Storage Modes**:
