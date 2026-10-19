@@ -56,6 +56,8 @@ Scans a directory of PDF files, determines if each file is already present in yo
   - Matches normalized Title + First Author
 - **Multi-Level Metadata Extraction**:
   - Detects DOIs in PDF text or metadata, then queries the **CrossRef API** for complete bibliographic details (title, authors, journal, year, volume, issue, pages).
+  - If no author is available in the PDF or matching Zotero reference, searches Crossref by title and fills missing author, DOI, ISBN, and bibliographic fields when the title matches closely.
+  - Existing Zotero references without authors are enriched in place; `--dry-run` never writes changes.
   - Reads embedded PDF document info (Title, Author, CreationDate).
   - Uses directory and filename heuristics (e.g. `.../<Journal>/<Year>/<Author> - <Title>.pdf`).
 - **Flexible Storage Modes**:

@@ -1,17 +1,22 @@
 """PDF Import Engine for Zotero."""
 
 import os
+import re
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Generator, Optional
 
 from zotero_cleaner.client import ZoteroClient
+from zotero_cleaner.models import ZoteroItem
 from pdf_importer.config import PDFImporterConfig, DEFAULT_IMPORTER_CONFIG
 from pdf_importer.extractor import (
     ExtractedMetadata,
     compute_file_md5,
     extract_pdf_metadata,
+    fetch_crossref_metadata_by_title,
+    merge_missing_metadata,
+    parse_filename_heuristics,
 )
 from pdf_importer.indexer import ZoteroLibraryIndex
 
@@ -98,6 +103,7 @@ class PDFImporter:
         dry_run: bool = False,
         use_crossref: bool = True,
         compute_md5: bool = True,
+        extracted_metadata: Optional[ExtractedMetadata] = None,
     ) -> ItemImportRecord:
         """
         Process a single PDF: check duplicates, extract metadata, and import if new.
@@ -107,8 +113,7 @@ class PDFImporter:
 
         # 1. Quick duplicate check (filename & path)
         is_dup, reason = self.index.check_duplicate(file_path)
-        if is_dup:
-            return ItemImportRecord(file_path=file_path, status="skipped_duplicate", reason=reason)
+        quick_duplicate_reason = reason if is_dup else None
 
         # 2. Compute MD5 checksum and verify duplicate
         md5_hash = None
@@ -116,12 +121,8 @@ class PDFImporter:
             try:
                 md5_hash = compute_file_md5(file_path)
                 is_dup, reason = self.index.check_duplicate(file_path, md5_hash=md5_hash)
-                if is_dup:
-                    return ItemImportRecord(
-                        file_path=file_path,
-                        status="skipped_duplicate",
-                        reason=reason,
-                    )
+                if is_dup and not quick_duplicate_reason:
+                    quick_duplicate_reason = reason
             except Exception as e:
                 return ItemImportRecord(
                     file_path=file_path,
@@ -130,18 +131,64 @@ class PDFImporter:
                 )
 
         # 3. Extract metadata
-        try:
-            metadata = extract_pdf_metadata(
-                file_path,
-                use_crossref=use_crossref,
-                timeout=self.config.crossref_timeout,
-            )
-        except Exception as e:
-            metadata = ExtractedMetadata(title=file_path.stem, source="fallback")
+        if extracted_metadata is None:
+            try:
+                metadata = extract_pdf_metadata(
+                    file_path,
+                    use_crossref=use_crossref,
+                    timeout=self.config.crossref_timeout,
+                )
+            except Exception:
+                metadata = ExtractedMetadata(
+                    title=file_path.stem,
+                    source="fallback",
+                )
+        else:
+            metadata = extracted_metadata
+
+        reference = self.index.find_reference(metadata)
+        enrichment_preview = False
+        if reference and not reference.data.creators and use_crossref:
+            supplement = None
+            if metadata.source == "crossref_title" and metadata.creators:
+                supplement = metadata
+            else:
+                supplement = fetch_crossref_metadata_by_title(
+                    reference.title or metadata.title,
+                    timeout=self.config.crossref_timeout,
+                )
+            if supplement:
+                merge_missing_metadata(metadata, supplement)
+                patch_data = self._missing_reference_fields(
+                    reference,
+                    supplement,
+                )
+                if patch_data and dry_run:
+                    enrichment_preview = True
+                elif patch_data:
+                    try:
+                        self.client.update_item_data(
+                            reference.key,
+                            reference.version,
+                            patch_data,
+                        )
+                    except Exception as e:
+                        return ItemImportRecord(
+                            file_path=file_path,
+                            status="error",
+                            reason=(
+                                f"Failed to enrich Zotero item {reference.key}: {e}"
+                            ),
+                            metadata=metadata,
+                        )
 
         # 4. Deep duplicate check (DOI and Title + Author)
         is_dup, reason = self.index.check_duplicate(file_path, md5_hash=md5_hash, metadata=metadata)
+        if quick_duplicate_reason:
+            is_dup, reason = True, quick_duplicate_reason
         if is_dup:
+            if enrichment_preview:
+                reason = f"{reason}; Zotero metadata would be enriched"
             return ItemImportRecord(
                 file_path=file_path,
                 status="skipped_duplicate",
@@ -178,6 +225,363 @@ class PDFImporter:
                 reason=f"Failed to create item in Zotero: {e}",
                 metadata=metadata,
             )
+
+    @staticmethod
+    def _missing_reference_fields(
+        reference: ZoteroItem,
+        metadata: ExtractedMetadata,
+    ) -> dict[str, Any]:
+        data = reference.data
+        patch: dict[str, Any] = {}
+        if not data.creators and metadata.creators:
+            patch["creators"] = metadata.creators
+        field_map = {
+            "date": "date",
+            "publication_title": "publicationTitle",
+            "doi": "DOI",
+            "isbn": "ISBN",
+            "abstract_note": "abstractNote",
+            "url": "url",
+            "volume": "volume",
+            "issue": "issue",
+            "pages": "pages",
+        }
+        for metadata_field, zotero_field in field_map.items():
+            value = getattr(metadata, metadata_field)
+            if value and not getattr(data, zotero_field, None):
+                patch[zotero_field] = value
+        return patch
+
+    @staticmethod
+    def _filename_author(
+        file_path: Path,
+    ) -> tuple[tuple[str, str], dict[str, str]] | None:
+        if " - " not in file_path.stem:
+            return None
+        creators = parse_filename_heuristics(file_path).creators
+        if not creators:
+            return None
+        creator = creators[0]
+        first_name = creator.get("firstName", "").strip()
+        last_name = creator.get("lastName", "").strip()
+        name = creator.get("name", "").strip()
+        identity = (last_name.casefold(), first_name.casefold())
+        if not any(identity) and name:
+            identity = (name.casefold(), "")
+        if not any(identity):
+            return None
+        return identity, creator
+
+    def _find_book_groups(
+        self,
+        pdf_files: list[Path],
+        use_crossref: bool,
+    ) -> tuple[
+        list[tuple[list[Path], ExtractedMetadata]],
+        dict[Path, ExtractedMetadata],
+    ]:
+        candidates: dict[tuple[Path, tuple[str, str]], list[Path]] = {}
+        for file_path in pdf_files:
+            author = self._filename_author(file_path)
+            if author:
+                identity, _ = author
+                key = (file_path.parent.resolve(), identity)
+                candidates.setdefault(key, []).append(file_path)
+
+        groups: list[tuple[list[Path], ExtractedMetadata]] = []
+        metadata_cache: dict[Path, ExtractedMetadata] = {}
+        for paths in candidates.values():
+            if len(paths) < 2:
+                continue
+
+            unresolved: list[Path] = []
+            for file_path in paths:
+                try:
+                    metadata = extract_pdf_metadata(
+                        file_path,
+                        use_crossref=use_crossref,
+                        timeout=self.config.crossref_timeout,
+                    )
+                except Exception:
+                    metadata = ExtractedMetadata(
+                        title=file_path.stem,
+                        source="fallback",
+                    )
+
+                metadata_cache[file_path] = metadata
+                if metadata.source in ("crossref", "crossref_title"):
+                    continue
+                if not metadata.creators:
+                    # Extraction already tried a title lookup without finding a match.
+                    unresolved.append(file_path)
+                    continue
+                if not use_crossref:
+                    unresolved.append(file_path)
+                    continue
+
+                match = fetch_crossref_metadata_by_title(
+                    metadata.title,
+                    timeout=self.config.crossref_timeout,
+                )
+                if match:
+                    merge_missing_metadata(metadata, match)
+                else:
+                    unresolved.append(file_path)
+
+            if len(unresolved) < 2:
+                continue
+
+            first_path = unresolved[0]
+            author = self._filename_author(first_path)
+            if not author:
+                continue
+            _, creator = author
+            book_directory = first_path.parent
+            year = None
+            if re.fullmatch(r"(?:19|20)\d{2}", book_directory.name):
+                year = book_directory.name
+                book_directory = book_directory.parent
+            book_metadata = ExtractedMetadata(
+                title=book_directory.name,
+                creators=[creator],
+                date=year,
+                item_type="book",
+                source="filename_group",
+            )
+            groups.append((unresolved, book_metadata))
+
+        return groups, metadata_cache
+
+    def _create_zotero_book_entry(
+        self,
+        file_paths: list[Path],
+        metadata: ExtractedMetadata,
+        md5_hashes: dict[Path, str],
+        existing_reference: Optional[ZoteroItem] = None,
+    ) -> tuple[str, dict[Path, str], dict[Path, str]]:
+        parent_key = existing_reference.key if existing_reference else None
+        parent_version = (
+            existing_reference.version if existing_reference else None
+        )
+        created_parent = False
+
+        if not existing_reference:
+            response = self.client.create_items(
+                [metadata.to_zotero_item_payload()]
+            )
+            successful = response.get("successful", {})
+            if not successful:
+                raise RuntimeError(
+                    f"Book item creation failed: {response.get('failed', {})}"
+                )
+            parent_info = next(iter(successful.values()))
+            parent_key = parent_info.get("key")
+            parent_version = parent_info.get("version")
+            created_parent = True
+
+        attachment_payloads = []
+        for file_path in file_paths:
+            if self.config.link_mode == "linked":
+                attachment_payloads.append({
+                    "itemType": "attachment",
+                    "parentItem": parent_key,
+                    "linkMode": "linked_file",
+                    "title": file_path.name,
+                    "path": str(file_path.resolve()),
+                    "contentType": "application/pdf",
+                })
+            else:
+                attachment_payloads.append({
+                    "itemType": "attachment",
+                    "parentItem": parent_key,
+                    "linkMode": "imported_file",
+                    "title": file_path.name,
+                    "filename": file_path.name,
+                    "contentType": "application/pdf",
+                })
+
+        attached: dict[Path, str] = {}
+        errors: dict[Path, str] = {}
+        try:
+            for start in range(0, len(file_paths), 50):
+                batch_paths = file_paths[start:start + 50]
+                batch_payloads = attachment_payloads[start:start + 50]
+                response = self.client.create_items(
+                    batch_payloads,
+                    current_version=parent_version,
+                )
+                successful = response.get("successful", {})
+                failed = response.get("failed", {})
+                for offset, file_path in enumerate(batch_paths):
+                    item_info = successful.get(str(offset))
+                    if not item_info:
+                        errors[file_path] = str(
+                            failed.get(
+                                str(offset),
+                                "Attachment creation failed",
+                            )
+                        )
+                        continue
+                    child_key = item_info.get("key")
+                    if not child_key:
+                        errors[file_path] = (
+                            "Zotero did not return an attachment key"
+                        )
+                        continue
+                    attached[file_path] = child_key
+                    if self.config.link_mode == "imported":
+                        storage_item_dir = self.config.storage_dir / child_key
+                        storage_item_dir.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(
+                            file_path,
+                            storage_item_dir / file_path.name,
+                        )
+        except Exception:
+            if created_parent and not attached:
+                try:
+                    self.client.delete_item(parent_key, parent_version)
+                except Exception:
+                    pass
+            raise
+
+        if created_parent and not attached:
+            try:
+                self.client.delete_item(parent_key, parent_version)
+            except Exception:
+                pass
+        return parent_key, attached, errors
+
+    def _import_book_group(
+        self,
+        file_paths: list[Path],
+        metadata: ExtractedMetadata,
+        dry_run: bool,
+    ) -> list[ItemImportRecord]:
+        records: list[ItemImportRecord] = []
+        pending_paths: list[Path] = []
+        md5_hashes: dict[Path, str] = {}
+
+        for file_path in file_paths:
+            is_duplicate, reason = self.index.check_duplicate(file_path)
+            if is_duplicate:
+                records.append(ItemImportRecord(
+                    file_path=file_path,
+                    status="skipped_duplicate",
+                    reason=reason,
+                    metadata=metadata,
+                ))
+                continue
+            try:
+                md5_hash = compute_file_md5(file_path)
+            except Exception as error:
+                records.append(ItemImportRecord(
+                    file_path=file_path,
+                    status="error",
+                    reason=f"Failed to read file for MD5: {error}",
+                    metadata=metadata,
+                ))
+                continue
+            is_duplicate, reason = self.index.check_duplicate(
+                file_path,
+                md5_hash=md5_hash,
+            )
+            if is_duplicate:
+                records.append(ItemImportRecord(
+                    file_path=file_path,
+                    status="skipped_duplicate",
+                    reason=reason,
+                    metadata=metadata,
+                ))
+                continue
+            pending_paths.append(file_path)
+            md5_hashes[file_path] = md5_hash
+
+        if not pending_paths:
+            return records
+
+        existing_reference = self.index.find_reference(metadata)
+        if existing_reference and existing_reference.data.itemType != "book":
+            for file_path in pending_paths:
+                records.append(ItemImportRecord(
+                    file_path=file_path,
+                    status="skipped_duplicate",
+                    reason="A matching Zotero item exists but is not a book",
+                    metadata=metadata,
+                ))
+            return records
+
+        if existing_reference:
+            patch_data = self._missing_reference_fields(
+                existing_reference,
+                metadata,
+            )
+            if patch_data and not dry_run:
+                try:
+                    self.client.update_item_data(
+                        existing_reference.key,
+                        existing_reference.version,
+                        patch_data,
+                    )
+                except Exception as error:
+                    return records + [ItemImportRecord(
+                        file_path=file_path,
+                        status="error",
+                        reason=f"Failed to enrich Zotero book: {error}",
+                        metadata=metadata,
+                    ) for file_path in pending_paths]
+
+        if dry_run:
+            action = (
+                "Would attach to existing book"
+                if existing_reference
+                else "Would create book and attach"
+            )
+            return records + [ItemImportRecord(
+                file_path=file_path,
+                status="dry_run_import",
+                reason=f"{action}: {metadata.title}",
+                metadata=metadata,
+            ) for file_path in pending_paths]
+
+        try:
+            parent_key, attached, errors = self._create_zotero_book_entry(
+                pending_paths,
+                metadata,
+                md5_hashes,
+                existing_reference=existing_reference,
+            )
+        except Exception as error:
+            return records + [ItemImportRecord(
+                file_path=file_path,
+                status="error",
+                reason=f"Failed to create Zotero book: {error}",
+                metadata=metadata,
+            ) for file_path in pending_paths]
+
+        for file_path in pending_paths:
+            if file_path in errors:
+                records.append(ItemImportRecord(
+                    file_path=file_path,
+                    status="error",
+                    reason=errors[file_path],
+                    metadata=metadata,
+                ))
+                continue
+            if file_path not in attached:
+                continue
+            self.index.record_imported(
+                file_path,
+                md5_hash=md5_hashes[file_path],
+                metadata=metadata,
+            )
+            records.append(ItemImportRecord(
+                file_path=file_path,
+                status="imported",
+                item_key=parent_key,
+                reason=f"Attached to Zotero book {parent_key}",
+                metadata=metadata,
+            ))
+        return records
 
     def _create_zotero_entry(
         self,
@@ -260,28 +664,50 @@ class PDFImporter:
         Scan and process all PDFs in target directory.
         """
         summary = ImportSummary()
-        processed_count = 0
+        pdf_files = list(
+            discover_pdf_files(directory, recursive=recursive, max_files=max_files)
+        )
+        groups, metadata_cache = self._find_book_groups(pdf_files, use_crossref)
+        groups_by_first_path = {
+            paths[0]: (paths, metadata)
+            for paths, metadata in groups
+        }
+        processed_paths: set[Path] = set()
 
-        for pdf_path in discover_pdf_files(directory, recursive=recursive, max_files=max_files):
-            processed_count += 1
+        def record_processed(record: ItemImportRecord):
+            processed_count = summary.total_scanned + 1
             summary.total_scanned += 1
-
-            record = self.import_single_pdf(
-                pdf_path,
-                dry_run=dry_run,
-                use_crossref=use_crossref,
-            )
-
             if record.status in ("imported", "dry_run_import"):
                 summary.imported += 1
             elif record.status == "skipped_duplicate":
                 summary.duplicates_skipped += 1
             elif record.status == "error":
                 summary.errors += 1
-
             summary.records.append(record)
-
             if on_file_processed:
                 on_file_processed(record, processed_count)
+
+        for pdf_path in pdf_files:
+            if pdf_path in processed_paths:
+                continue
+            group = groups_by_first_path.get(pdf_path)
+            if group:
+                paths, metadata = group
+                for record in self._import_book_group(
+                    paths,
+                    metadata,
+                    dry_run,
+                ):
+                    record_processed(record)
+                processed_paths.update(paths)
+                continue
+
+            record = self.import_single_pdf(
+                pdf_path,
+                dry_run=dry_run,
+                use_crossref=use_crossref,
+                extracted_metadata=metadata_cache.get(pdf_path),
+            )
+            record_processed(record)
 
         return summary

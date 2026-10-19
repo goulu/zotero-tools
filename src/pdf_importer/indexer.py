@@ -29,6 +29,8 @@ class ZoteroLibraryIndex:
         self.dois: set[str] = set()
         self.titles: set[str] = set()
         self.title_author_pairs: set[tuple[str, str]] = set()
+        self.references_by_doi: dict[str, ZoteroItem] = {}
+        self.references_by_title: dict[str, ZoteroItem] = {}
 
     @property
     def total_attachments(self) -> int:
@@ -91,11 +93,14 @@ class ZoteroLibraryIndex:
 
     def _index_reference(self, item: ZoteroItem):
         if item.doi:
-            self.dois.add(clean_doi(item.doi).lower())
+            normalized_doi = clean_doi(item.doi).lower()
+            self.dois.add(normalized_doi)
+            self.references_by_doi[normalized_doi] = item
         if item.title:
             norm_t = normalize_title(item.title)
             if len(norm_t) > 5:
                 self.titles.add(norm_t)
+                self.references_by_title[norm_t] = item
 
                 # Author last name pair
                 author_last = ""
@@ -108,6 +113,16 @@ class ZoteroLibraryIndex:
                         break
                 if author_last:
                     self.title_author_pairs.add((norm_t, author_last))
+
+    def find_reference(self, metadata: ExtractedMetadata) -> Optional[ZoteroItem]:
+        """Find an indexed reference by DOI or exact normalized title."""
+        if metadata.doi:
+            item = self.references_by_doi.get(clean_doi(metadata.doi).lower())
+            if item:
+                return item
+        if metadata.title:
+            return self.references_by_title.get(normalize_title(metadata.title))
+        return None
 
     def check_duplicate(
         self,
@@ -138,6 +153,9 @@ class ZoteroLibraryIndex:
 
             if metadata.title:
                 norm_t = normalize_title(metadata.title)
+                matching_reference = self.references_by_title.get(norm_t)
+                if matching_reference and not matching_reference.data.creators:
+                    return True, f"Title matched existing item without an author ('{metadata.title}')"
                 author_last = ""
                 if metadata.creators:
                     c0 = metadata.creators[0]

@@ -11,6 +11,7 @@ import logging
 import re
 import warnings
 from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Optional
 import httpx
@@ -30,6 +31,7 @@ class ExtractedMetadata:
     date: Optional[str] = None
     publication_title: Optional[str] = None
     doi: Optional[str] = None
+    isbn: Optional[str] = None
     item_type: str = "journalArticle"
     abstract_note: Optional[str] = None
     url: Optional[str] = None
@@ -52,6 +54,8 @@ class ExtractedMetadata:
             payload["publicationTitle"] = self.publication_title
         if self.doi:
             payload["DOI"] = self.doi
+        if self.isbn:
+            payload["ISBN"] = self.isbn
         if self.abstract_note:
             payload["abstractNote"] = self.abstract_note
         if self.url:
@@ -113,69 +117,139 @@ def fetch_crossref_metadata(doi: str, timeout: float = 6.0) -> Optional[Extracte
             if not message:
                 return None
 
-            # Extract Title
-            titles = message.get("title", [])
-            title = titles[0].strip() if titles else ""
-            if not title:
-                return None
-
-            # Extract Publication / Journal
-            containers = message.get("container-title", [])
-            pub_title = containers[0].strip() if containers else None
-
-            # Extract Authors
-            creators: list[dict[str, str]] = []
-            for author in message.get("author", []):
-                given = author.get("given", "").strip()
-                family = author.get("family", "").strip()
-                name = author.get("name", "").strip()
-                if family or given:
-                    creators.append({
-                        "creatorType": "author",
-                        "firstName": given,
-                        "lastName": family,
-                    })
-                elif name:
-                    creators.append({
-                        "creatorType": "author",
-                        "name": name,
-                    })
-
-            # Extract Date / Year
-            date_str = None
-            issued = message.get("issued", {}).get("date-parts", [[]])
-            if issued and issued[0]:
-                parts = [str(p) for p in issued[0] if p is not None]
-                date_str = "-".join(parts)
-
-            # Map Item Type
-            crossref_type = message.get("type", "journal-article")
-            type_mapping = {
-                "journal-article": "journalArticle",
-                "proceedings-article": "conferencePaper",
-                "book": "book",
-                "book-chapter": "bookSection",
-                "report": "report",
-                "posted-content": "preprint",
-            }
-            item_type = type_mapping.get(crossref_type, "journalArticle")
-
-            return ExtractedMetadata(
-                title=title,
-                creators=creators,
-                date=date_str,
-                publication_title=pub_title,
-                doi=cleaned,
-                item_type=item_type,
-                abstract_note=message.get("abstract"),
-                url=message.get("URL"),
-                volume=str(message.get("volume")) if message.get("volume") else None,
-                issue=str(message.get("issue")) if message.get("issue") else None,
-                pages=message.get("page"),
-                source="crossref",
-            )
+            return _parse_crossref_message(message, doi=cleaned)
     except Exception:
         return None
+
+
+def fetch_crossref_metadata_by_title(
+    title: str,
+    timeout: float = 6.0,
+) -> Optional[ExtractedMetadata]:
+    """Search Crossref by title and accept only a close title match."""
+    normalized_title = re.sub(r"[^\w\s]", "", title.lower())
+    normalized_title = " ".join(normalized_title.split())
+    if not normalized_title:
+        return None
+
+    url = "https://api.crossref.org/works"
+    headers = {"User-Agent": "ZoteroTools/0.1.0 (mailto:zotero-tools@local)"}
+    try:
+        with httpx.Client(timeout=timeout) as client:
+            response = client.get(
+                url,
+                params={"query.title": title, "rows": 5},
+                headers=headers,
+            )
+            if response.status_code != 200:
+                return None
+            items = response.json().get("message", {}).get("items", [])
+
+        matches = []
+        for item in items:
+            titles = item.get("title", [])
+            candidate_title = titles[0].strip() if titles else ""
+            normalized_candidate = re.sub(
+                r"[^\w\s]", "", candidate_title.lower()
+            )
+            normalized_candidate = " ".join(normalized_candidate.split())
+            ratio = SequenceMatcher(
+                None, normalized_title, normalized_candidate
+            ).ratio()
+            if ratio >= 0.85:
+                matches.append((ratio, item))
+
+        matches.sort(key=lambda match: match[0], reverse=True)
+        if not matches:
+            return None
+        if len(matches) > 1 and matches[0][0] - matches[1][0] < 0.03:
+            return None
+        return _parse_crossref_message(matches[0][1])
+    except Exception:
+        return None
+    return None
+
+
+def _parse_crossref_message(
+    message: dict[str, Any],
+    doi: Optional[str] = None,
+) -> Optional[ExtractedMetadata]:
+    titles = message.get("title", [])
+    title = titles[0].strip() if titles else ""
+    if not title:
+        return None
+
+    containers = message.get("container-title", [])
+    creators: list[dict[str, str]] = []
+    for author in message.get("author", []):
+        given = author.get("given", "").strip()
+        family = author.get("family", "").strip()
+        name = author.get("name", "").strip()
+        if family or given:
+            creators.append({
+                "creatorType": "author",
+                "firstName": given,
+                "lastName": family,
+            })
+        elif name:
+            creators.append({"creatorType": "author", "name": name})
+
+    date_str = None
+    issued = message.get("issued", {}).get("date-parts", [[]])
+    if issued and issued[0]:
+        parts = [str(part) for part in issued[0] if part is not None]
+        date_str = "-".join(parts)
+
+    type_mapping = {
+        "journal-article": "journalArticle",
+        "proceedings-article": "conferencePaper",
+        "book": "book",
+        "book-chapter": "bookSection",
+        "report": "report",
+        "posted-content": "preprint",
+    }
+    isbn_values = message.get("ISBN", [])
+    if isinstance(isbn_values, str):
+        isbn = isbn_values
+    else:
+        isbn = isbn_values[0] if isbn_values else None
+    return ExtractedMetadata(
+        title=title,
+        creators=creators,
+        date=date_str,
+        publication_title=containers[0].strip() if containers else None,
+        doi=clean_doi(doi or message.get("DOI", "")) or None,
+        isbn=isbn,
+        item_type=type_mapping.get(
+            message.get("type", "journal-article"), "journalArticle"
+        ),
+        abstract_note=message.get("abstract"),
+        url=message.get("URL"),
+        volume=str(message.get("volume")) if message.get("volume") else None,
+        issue=str(message.get("issue")) if message.get("issue") else None,
+        pages=message.get("page"),
+        source="crossref",
+    )
+
+
+def merge_missing_metadata(
+    metadata: ExtractedMetadata,
+    supplement: ExtractedMetadata,
+) -> ExtractedMetadata:
+    """Fill empty bibliographic fields without replacing extracted values."""
+    if not metadata.creators:
+        metadata.creators = supplement.creators
+    for field_name in (
+        "date", "publication_title", "doi", "isbn", "abstract_note", "url",
+        "volume", "issue", "pages",
+    ):
+        if not getattr(metadata, field_name):
+            setattr(metadata, field_name, getattr(supplement, field_name))
+    if metadata.item_type == "document":
+        metadata.item_type = supplement.item_type
+    if supplement.creators:
+        metadata.source = "crossref_title"
+    return metadata
 
 
 def parse_filename_heuristics(file_path: Path) -> ExtractedMetadata:
@@ -319,10 +393,12 @@ def extract_pdf_metadata(file_path: Path, use_crossref: bool = True, timeout: fl
         pass
 
     # Step 2: If DOI found and CrossRef enabled, query CrossRef
+    crossref_meta = None
     if found_doi and use_crossref:
         cr_meta = fetch_crossref_metadata(found_doi, timeout=timeout)
-        if cr_meta:
+        if cr_meta and cr_meta.creators:
             return cr_meta
+        crossref_meta = cr_meta
 
     # Step 3: Heuristic extraction from filename and parent directories
     heuristic_meta = parse_filename_heuristics(file_path)
@@ -342,5 +418,16 @@ def extract_pdf_metadata(file_path: Path, use_crossref: bool = True, timeout: fl
 
     if pdf_meta_date and not heuristic_meta.date:
         heuristic_meta.date = pdf_meta_date
+
+    if crossref_meta:
+        merge_missing_metadata(heuristic_meta, crossref_meta)
+
+    if use_crossref and not heuristic_meta.creators:
+        title_meta = fetch_crossref_metadata_by_title(
+            heuristic_meta.title,
+            timeout=timeout,
+        )
+        if title_meta:
+            merge_missing_metadata(heuristic_meta, title_meta)
 
     return heuristic_meta
