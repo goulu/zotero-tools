@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "zotero-cleaner"
+name = "zotero-tools"
 version = "0.1.0"
-description = "Audit and cleaning tool for Zotero libraries via the local HTTP API"
+description = "Tools for Zotero libraries via the local HTTP API (cleaner and PDF importer)"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -14,6 +14,7 @@ dependencies = [
     "typer>=0.12.0",
     "pydantic>=2.7.0",
     "python-dotenv>=1.0.0",
+    "pypdf>=5.0.0",
 ]
 
 [project.optional-dependencies]
@@ -23,6 +24,8 @@ dev = [
 
 [project.scripts]
 zotero-cleaner = "zotero_cleaner.cli:app"
+pdf-importer = "pdf_importer.cli:app"
+zotero-import-pdf = "pdf_importer.cli:app"
 
 [tool.setuptools.packages.find]
 where = ["src"]

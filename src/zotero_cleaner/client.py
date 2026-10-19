@@ -329,3 +329,61 @@ class ZoteroClient:
         if resp.status_code != 200:
             raise ZoteroClientError(f"Collections error: HTTP {resp.status_code}")
         return resp.json()
+
+    def get_library_version(self) -> int:
+        """Get current library version from Last-Modified-Version header."""
+        resp = self.client.get(f"/api/users/{self.config.user_id}/items?limit=1")
+        self._capture_server_id(resp)
+        return int(resp.headers.get("Last-Modified-Version", 0))
+
+    def create_items(
+        self,
+        items_data: list[dict[str, Any]],
+        current_version: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """
+        Create one or more items in the library.
+        Returns the parsed response dict containing 'successful', 'success', 'failed'.
+        """
+        if current_version is None:
+            current_version = self.get_library_version()
+
+        headers = self._prepare_write_headers(current_version)
+        headers["Content-Type"] = "application/json"
+
+        resp = self.client.post(
+            f"/api/users/{self.config.user_id}/items",
+            headers=headers,
+            json=items_data,
+        )
+        self._capture_server_id(resp)
+
+        if resp.status_code in (401, 428):
+            if resp.status_code == 401 or "API key required" in resp.text:
+                self.request_authorization()
+                headers = self._prepare_write_headers(current_version)
+                headers["Content-Type"] = "application/json"
+                resp = self.client.post(
+                    f"/api/users/{self.config.user_id}/items",
+                    headers=headers,
+                    json=items_data,
+                )
+                self._capture_server_id(resp)
+
+        if resp.status_code == 412:
+            # Version conflict, retry once with refreshed version
+            current_version = self.get_library_version()
+            headers = self._prepare_write_headers(current_version)
+            headers["Content-Type"] = "application/json"
+            resp = self.client.post(
+                f"/api/users/{self.config.user_id}/items",
+                headers=headers,
+                json=items_data,
+            )
+            self._capture_server_id(resp)
+
+        if resp.status_code not in (200, 201):
+            raise ZoteroClientError(f"Failed to create items: HTTP {resp.status_code} - {resp.text}")
+
+        return resp.json() if resp.content else {}
+

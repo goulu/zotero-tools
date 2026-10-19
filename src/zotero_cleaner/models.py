@@ -44,6 +44,7 @@ class ItemData(BaseModel):
     filename: Optional[str] = None
     contentType: Optional[str] = None
     linkMode: Optional[str] = None
+    path: Optional[str] = None
     md5: Optional[str] = None
     mtime: Optional[int] = None
     dateAdded: Optional[str] = None
@@ -71,6 +72,10 @@ class ZoteroItem(BaseModel):
     @property
     def md5(self) -> Optional[str]:
         return self.data.md5
+
+    @property
+    def path(self) -> Optional[str]:
+        return getattr(self.data, "path", None)
 
     @property
     def is_attachment_or_note(self) -> bool:
