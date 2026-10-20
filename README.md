@@ -2,9 +2,10 @@
 
 A suite of high-performance Python tools to audit, clean, and populate your Zotero bibliography by communicating directly with the local Zotero HTTP API (`http://localhost:23119/api`).
 
-The suite includes two primary tools:
+The suite includes three tools:
 1. **`zotero-cleaner`** 🧹 : Library audit, title/tag cleanup, attachment verification, and duplicate detection/cleanup.
 2. **`pdf-importer`** (or `zotero-import-pdf`) 📥 : Fast batch PDF importer with automatic metadata extraction (DOI + CrossRef, PDF Info, directory & filename heuristics) and duplicate prevention.
+3. **`pour-la-science`** : Finds articles in Pour la Science issues and imports them into Zotero.
 
 Designed for **maximum safety** with **dry-run simulation modes**.
 
@@ -39,6 +40,32 @@ ZOTERO_TIMEOUT=30
 PDF_IMPORT_DIR=/home/goulu/moulinette/Documents/Articles
 PDF_IMPORT_MODE=imported
 ZOTERO_STORAGE_DIR=/home/goulu/Zotero/storage
+
+# Pour la Science account (keep these values local; do not commit them)
+POURLASCIENCE_EMAIL=your_account_email
+POURLASCIENCE_PASSWORD=your_account_password
+```
+
+Connect to the archives with `PourLaScienceClient`:
+
+```python
+from pour_la_science import PourLaScienceClient
+
+with PourLaScienceClient() as client:
+  client.login()
+  archives_page = client.get_archives_page()
+```
+
+Parse an issue and preview missing articles (dry-run by default):
+
+```bash
+pour-la-science "https://www.pourlascience.fr/sd/physique-particules/pour-la-science-n588-29539.php"
+```
+
+Add the missing articles to Zotero after checking the preview:
+
+```bash
+pour-la-science "https://www.pourlascience.fr/sd/physique-particules/pour-la-science-n588-29539.php" --apply
 ```
 
 ---

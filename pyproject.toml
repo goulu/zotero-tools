@@ -26,6 +26,7 @@ dev = [
 zotero-cleaner = "zotero_cleaner.cli:app"
 pdf-importer = "pdf_importer.cli:app"
 zotero-import-pdf = "pdf_importer.cli:app"
+pour-la-science = "pour_la_science.cli:app"
 
 [tool.setuptools.packages.find]
 where = ["src"]
